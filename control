@@ -1,0 +1,9 @@
+Package: top.anjao2024.whs-ios
+Name: WHS for Xiaohongshu iOS
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: 小红书增强 tweak（去广告/下载/书签/UI 增强），移植自 WHS Android 模块 v3.0.9
+Depends: mobilesubstrate (>= 0.9.7000) | ellekit
+Maintainer: anjao2024
+Author: anjao2024
+Section: Tweaks

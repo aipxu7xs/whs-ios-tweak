@@ -1,0 +1,44 @@
+name: Build WHS iOS dylib
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download iOS SDK (theos/sdks)
+        run: |
+          URL=$(curl -s https://api.github.com/repos/theos/sdks/releases/latest \
+                | grep -o 'https://[^"]*iPhoneOS.sdk.tar.xz' | head -1)
+          echo "SDK_URL=$URL"
+          curl -L -o iPhoneOS.sdk.tar.xz "$URL"
+          tar -xf iPhoneOS.sdk.tar.xz
+          echo "SDK=$PWD/iPhoneOS.sdk" >> "$GITHUB_ENV"
+
+      - name: Build tweak.dylib
+        run: make SDK="$SDK"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WHS-tweak-dylib
+          path: tweak.dylib
+
+      - name: Publish Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" tweak.dylib \
+            --title "WHS dylib 自动构建 #${{ github.run_number }}" \
+            --notes "云端自动构建的 tweak.dylib（注入小红书 iOS 即可原图下载 + EXIF）。" \
+            || gh release upload "$TAG" tweak.dylib --clobber

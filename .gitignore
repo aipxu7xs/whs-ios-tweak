@@ -1,0 +1,8 @@
+# 不纳入仓库的大文件 / 构建产物
+Xiaohongshu.ipa
+extracted/
+*.dylib
+*.o
+.DS_Store
+iPhoneOS.sdk.tar.xz
+iPhoneOS.sdk/
