@@ -16,13 +16,25 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download iOS SDK (theos/sdks)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          URL=$(curl -s https://api.github.com/repos/theos/sdks/releases/latest \
-                | grep -o 'https://[^"]*iPhoneOS.sdk.tar.xz' | head -1)
-          echo "SDK_URL=$URL"
-          curl -L -o iPhoneOS.sdk.tar.xz "$URL"
+          python3 - <<'PY'
+          import urllib.request, json, re, os
+          hdr = {"Accept": "application/vnd.github+json",
+                 "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"]}
+          d = json.load(urllib.request.urlopen(
+              urllib.request.Request("https://api.github.com/repos/theos/sdks/releases/latest", headers=hdr), timeout=30))
+          cands = [a for a in d["assets"]
+                   if a["name"].startswith("iPhoneOS") and a["name"].endswith(".sdk.tar.xz")]
+          cands.sort(key=lambda a: [int(x) for x in re.findall(r'\d+', a["name"])])
+          best = cands[-1]
+          print("selected SDK asset:", best["name"])
+          urllib.request.urlretrieve(best["browser_download_url"], "iPhoneOS.sdk.tar.xz")
+          PY
           tar -xf iPhoneOS.sdk.tar.xz
-          echo "SDK=$PWD/iPhoneOS.sdk" >> "$GITHUB_ENV"
+          echo "SDK=$PWD/$(ls -d iPhoneOS*.sdk | head -1)" >> "$GITHUB_ENV"
+          echo "使用 SDK: $SDK"
 
       - name: Build tweak.dylib
         run: make SDK="$SDK"
