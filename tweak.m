@@ -242,6 +242,7 @@ static void whs_showExif(NSDictionary *exif) {
 }
 
 #pragma mark - 浮窗 + 兜底抓取 / 下载（核心入口）
+@class WHSSaveTrigger;
 static UIButton *whs_floatingButton = nil;
 static WHSSaveTrigger *whs_trigger = nil;
 
@@ -358,14 +359,14 @@ static void whs_downloadImageWithExif(NSString *urlString) {
         completionHandler:^(NSData *data, NSURLResponse *resp __attribute__((unused)), NSError *err) {
         if (!data || err) { whs_toast(@"下载失败"); return; }
         NSDictionary *exif = whs_extractExif(data);
-        [whs_saveImageData(data, ^(BOOL ok) {
+        whs_saveImageData(data, ^(BOOL ok) {
             if (ok) {
                 whs_toast(@"已保存到相册");
                 if (exif) whs_showExif(exif);
             } else {
                 whs_toast(@"保存失败（请允许相册权限）");
             }
-        }];
+        });
     }];
     [task resume];
 }
