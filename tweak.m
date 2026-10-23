@@ -115,7 +115,8 @@ static BOOL whs_isVideoURL(NSString *s) {
 }
 @end
 
-@class SDWebImageManager;
+@interface SDWebImageManager : NSObject
+@end
 @interface SDWebImageManager (WHS)
 - (id)whs_downloadImageWithURL:(NSURL *)url options:(NSUInteger)options
                        context:(id)context progress:(id)progress completed:(id)completed;
