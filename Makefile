@@ -11,7 +11,8 @@ CFLAGS = -fobjc-arc -dynamiclib -arch $(ARCH) \
          -isysroot $(SDK) -miphoneos-version-min=15.0 \
          -framework Foundation -framework UIKit \
          -framework Photos -framework AVFoundation -framework ImageIO \
-         -fvisibility=hidden -O2
+         -fvisibility=hidden -O2 \
+         -undefined dynamic_lookup
 
 tweak.dylib: tweak.m
 	$(CC) $(CFLAGS) -o $@ $<
