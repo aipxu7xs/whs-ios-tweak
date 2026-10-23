@@ -1,21 +1,19 @@
 /*
- * WHS iOS Tweak — 精简版：只做「原图下载 + EXIF 原始信息提取」
- * 移植自 Android WHS (top.anjao2024.xp1whs) v3.0.9 小红书增强模块
- * 形态：注入小红书 iOS App 的 dylib（TrollFools 自签名注入 / 或 Theos deb 越狱安装）
- * 构建：clang 直接编 dylib（见 Makefile），或 Theos（见 WHSTweak.plist filter）
+ * WHS iOS Tweak — 精简版：原图下载 + EXIF 提取
+ * 注入小红书 iOS（com.xingin.discover）的 dylib（TrollFools 自签 / Theos deb）
  *
- * 本版只保留用户要的功能：
- *   1) 原图下载 —— 浮窗 ↓ 按钮 / 双指长按，从界面抓取 CDN 原图 URL 下载到相册
- *      （同时解锁 App 原生保存开关，让 App 自带的长按保存也能用）
- *   2) EXIF 提取 —— 下载原图后解析 EXIF：相机品牌/型号、光圈、快门、ISO、焦距、镜头、拍摄时间
- *      弹窗展示，并自动复制到剪贴板，方便用户直接粘贴使用
+ * 实现要点（v0.3.0 重写）：
+ *   1) 浮窗用「独立顶层 UIWindow（windowLevel=Alert+100，挂在 foregroundActive 的
+ *      UIWindowScene 上）」，保证永远置顶、不被宿主 UI 遮挡、可拖动。
+ *   2) 抓取真实媒体 URL 不靠猜模型属性，而是 hook SDWebImage 的图片加载入口
+ *      （UIImageView + SDWebImageManager），App 加载哪张图就记录哪个真实 URL。
+ *      打开大图时加载的就是高清/原图，自然抓到原图。
+ *   3) 点浮窗 → 弹出「媒体列表」让你自己选下哪张（真正可控）；长按照片=快速存最近一张。
+ *   4) 下载走原始 CDN 链接（去掉 imageView2 缩放参数取满分辨率）；XHS 水印是叠加层，
+ *      原图本身无水印。
+ *   5) EXIF：下载原图后用 ImageIO 解析；但 XHS 上传服务端普遍抹掉 EXIF，多数图没有。
  *
- * 设计原则：防御式 hook —— 类/方法不存在就跳过，绝不崩溃。
- * 小红书 iOS 自家类前缀：XY / XHS / Xhs
- *
- * 开关（NSUserDefaults，defaults 已写好）：
- *   whs_enabled  总开关         默认 YES
- *   whs_save     下载/保存解锁   默认 YES
+ * 防御式 hook：类/方法不存在就跳过，绝不崩溃。
  */
 
 #import <Foundation/Foundation.h>
@@ -34,7 +32,7 @@ static BOOL whs_flag(NSString *key, BOOL def) {
     return v ? [v boolValue] : def;
 }
 
-#pragma mark - 目标守卫（只对小红书生效）
+#pragma mark - 目标守卫
 static BOOL whs_isTarget(void) {
     static int cached = -1;
     if (cached >= 0) return cached != 0;
@@ -44,154 +42,108 @@ static BOOL whs_isTarget(void) {
     return cached != 0;
 }
 
-#pragma mark - 通用 IMP 助手（直接替换方法实现，缺方法自动跳过）
-static BOOL whs_patchBool(Class cls, const char *selName, BOOL value) {
-    if (!cls) return NO;
-    SEL sel = sel_registerName(selName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) m = class_getClassMethod(cls, sel);
-    if (!m) return NO;
-    char rt[2] = {0};
-    method_getReturnType(m, rt, sizeof(rt));
-    if (rt[0] != 'c' && rt[0] != 'B' && rt[0] != 'i') return NO;
-    IMP imp = imp_implementationWithBlock(^BOOL(id self __attribute__((unused))) { return value; });
-    method_setImplementation(m, imp);
-    return YES;
-}
+#pragma mark - 前向声明
+static BOOL whs_isMediaHost(NSString *s);
+static UIWindow *whs_activeWindow(void);
+static UIViewController *whs_topController(void);
+static void whs_presentPicker(void);
 
-static BOOL whs_dropSetter(Class cls, const char *selName) {
-    if (!cls) return NO;
-    SEL sel = sel_registerName(selName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-    IMP imp = imp_implementationWithBlock(^(id self __attribute__((unused)), id val __attribute__((unused))) {});
-    method_setImplementation(m, imp);
-    return YES;
-}
+@interface WHSSaveTrigger : NSObject
++ (instancetype)shared;
+- (void)onTap;
+- (void)onLongPress:(UILongPressGestureRecognizer *)g;
+- (void)onPan:(UIPanGestureRecognizer *)g;
+@end
 
-static BOOL whs_patchVoid(Class cls, const char *selName) {
-    if (!cls) return NO;
-    SEL sel = sel_registerName(selName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) m = class_getClassMethod(cls, sel);
-    if (!m) return NO;
-    IMP imp = imp_implementationWithBlock(^(id self __attribute__((unused))) {});
-    method_setImplementation(m, imp);
-    return YES;
-}
+#pragma mark - 媒体 URL 捕获（核心：hook SDWebImage 加载层）
+static NSMutableOrderedSet<NSString *> *whs_captured = nil;   // 最近捕获的 URL（最新的在前）
+static dispatch_queue_t whs_captureQueue = NULL;
 
-static void whs_exchangeClass(Class cls, SEL a, SEL b) {
-    if (!cls) return;
-    Method m1 = class_getClassMethod(cls, a);
-    Method m2 = class_getClassMethod(cls, b);
-    if (!m1 || !m2) return;
-    method_exchangeImplementations(m1, m2);
-}
-
-static void whs_exchangeInstance(Class cls, SEL a, SEL b) {
-    if (!cls) return;
-    Method m1 = class_getInstanceMethod(cls, a);
-    Method m2 = class_getInstanceMethod(cls, b);
-    if (!m1 || !m2) return;
-    method_exchangeImplementations(m1, m2);
-}
-
-#pragma mark - 功能：下载/保存解锁（参考 HiveNoAds，已验证；让用户原生保存也能用）
-static const char *kWHSKnownSaveClasses[] = {
-    "XYPHMediaSaveConfig", "XYVFVideoDownloaderManager",
-    "XYNoteFeedbackFloatingConfig", "NoteFeedbackFloatingConfig",
-    "_TtC18XYNegativeFeedback12SaveProvider", "SaveProvider",
-    "_TtC18XYNegativeFeedback18SaveCellController", "SaveCellController",
-    "_TtC18XYNegativeFeedback16SaveImageService", "SaveImageService",
-    "_TtC12XYNoteModule16ImageSaveService", "ImageSaveService",
-    "_TtC12XYNoteModule19ImageSaveServiceAPM",
-    "_TtC18XYNegativeFeedback24NotePaidDownloadProvider", "NotePaidDownloadProvider",
-    "XHSAMiniToolSaveImageHandler", "XHSAMiniToolSaveFileHandler",
-    "XHSAMiniToolAlbumSaver", "XHSAResourceDownloader",
-    "XHSANativeShareViewController", "XHSAImagePickerController",
-    NULL
-};
-
-static void whs_patchSaveClass(Class cls) {
-    if (!cls) return;
-    whs_patchBool(cls, "disableSave", NO);
-    whs_patchBool(cls, "isDisableSave", NO);
-    whs_patchBool(cls, "forbidCopy", NO);
-    whs_patchBool(cls, "disableCopy", NO);
-    whs_patchBool(cls, "disableCopyAction", NO);
-    whs_patchBool(cls, "disableWatermark", YES);
-    whs_patchBool(cls, "disableWatermarkWhenSavingAlbum", YES);
-    whs_dropSetter(cls, "setDisableSave:");
-    whs_dropSetter(cls, "setForbidCopy:");
-    whs_dropSetter(cls, "setDisableCopy:");
-    whs_patchBool(cls, "hitUserNoteDownloadSwitch", NO);
-    whs_patchBool(cls, "userNoteDownloadSwitch", YES);
-    whs_patchBool(cls, "isFlowDownloadSwitchOn", YES);
-    whs_patchBool(cls, "notAllowDownloadMyVideos", NO);
-    whs_patchBool(cls, "allowDownload", YES);
-    whs_patchBool(cls, "shareImageSaveEnable", YES);
-    whs_patchBool(cls, "shareVideoSaveEnable", YES);
-    whs_patchBool(cls, "canSave", YES);
-    whs_patchBool(cls, "canDownload", YES);
-    whs_patchBool(cls, "isAvailable", YES);
-    whs_patchBool(cls, "enable", YES);
-    whs_patchBool(cls, "isEnabled", YES);
-    whs_patchBool(cls, "isPaidImageNote", NO);
-    whs_patchBool(cls, "isPaidDownload", NO);
-    whs_patchBool(cls, "hasPaidDownload", NO);
-    whs_patchBool(cls, "showPaidDownload", NO);
-    whs_patchVoid(cls, "checkShowCloseNoteDownloadSwitchToast");
-    whs_patchVoid(cls, "showCloseNoteDownloadSwitchToast");
-    whs_patchVoid(cls, "showDownloadPermissionToast");
-}
-
-// 在 JSON 流里把下载开关字段强制为允许（仅改 NSNumber，避免破坏结构）
-static void whs_patchDownloadObject(id obj) {
-    if ([obj isKindOfClass:[NSMutableDictionary class]]) {
-        NSDictionary *snap = [obj copy];
-        for (id k in snap) {
-            NSString *ks = [k isKindOfClass:[NSString class]] ? k : [k description];
-            id v = obj[k];
-            if ([v isKindOfClass:[NSNumber class]] &&
-                ([ks rangeOfString:@"disableSave" options:NSCaseInsensitiveSearch].length ||
-                 [ks rangeOfString:@"prevent_download" options:NSCaseInsensitiveSearch].length ||
-                 [ks rangeOfString:@"allow_download" options:NSCaseInsensitiveSearch].length ||
-                 [ks rangeOfString:@"can_download" options:NSCaseInsensitiveSearch].length)) {
-                obj[k] = @YES;
-            }
-            whs_patchDownloadObject(v);
+static void whs_captureURL(NSURL *url) {
+    if (!url) return;
+    NSString *s = url.absoluteString;
+    if (![s hasPrefix:@"http"]) return;
+    if (!whs_isMediaHost(s)) return;
+    dispatch_async(whs_captureQueue, ^{
+        if (!whs_captured) whs_captured = [NSMutableOrderedSet orderedSet];
+        [whs_captured removeObject:s];
+        [whs_captured insertObject:s atIndex:0];
+        if (whs_captured.count > 80) {
+            NSRange r = NSMakeRange(80, whs_captured.count - 80);
+            [whs_captured removeObjectsInRange:r];
         }
-    } else if ([obj isKindOfClass:[NSMutableArray class]]) {
-        for (id item in obj) whs_patchDownloadObject(item);
-    }
+    });
 }
 
-@interface NSJSONSerialization (WHS)
-+ (id)whs_JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)err;
+// 必须在 whs_isMediaHost 之前声明（下面用）
+static BOOL whs_isMediaHost(NSString *s) {
+    return [s containsString:@"xhscdn"] || [s containsString:@"xiaohongshu"] ||
+           [s containsString:@"sns-img"] || [s containsString:@"sns-webpic"] ||
+           [s containsString:@"sns-video"] || [s containsString:@"fe-video"] ||
+           [s containsString:@"ci.xiaohongshu"];
+}
+
+// 去掉缩放/水印参数，尽量取满分辨率原图
+static NSString *whs_originalURL(NSString *url) {
+    if (!url) return url;
+    // XHS CDN 常见缩放串：?imageView2/2/w/1080/.../format/webp 或 /wm 水印段
+    NSRange q = [url rangeOfString:@"?"];
+    if (q.location != NSNotFound) url = [url substringToIndex:q.location];
+    // 去掉末尾的 /wm 或 /w/ 之类水印/缩放路径段（保守：只去掉明确的 /wm）
+    url = [url stringByReplacingOccurrencesOfString:@"/wm" withString:@""];
+    return url;
+}
+
+static BOOL whs_isVideoURL(NSString *s) {
+    return [s containsString:@"video"] || [s.pathExtension.lowercaseString isEqualToString:@"mp4"] ||
+           [s containsString:@"mp4"] || [s containsString:@"mov"];
+}
+
+#pragma mark - SDWebImage hook
+@interface UIImageView (WHS)
+- (void)whs_sd_setImageWithURL:(NSURL *)url placeholderImage:(UIImage *)ph
+                       options:(NSUInteger)options context:(id)context
+                      progress:(id)progress completed:(id)completed;
 @end
-@implementation NSJSONSerialization (WHS)
-+ (id)whs_JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError **)err {
-    id obj = [self whs_JSONObjectWithData:data options:opt error:err]; // 调用原始实现
-    if ([obj isKindOfClass:[NSMutableDictionary class]] || [obj isKindOfClass:[NSMutableArray class]]) {
-        @try { whs_patchDownloadObject(obj); } @catch (__unused NSException *e) {}
-    }
-    return obj;
+@implementation UIImageView (WHS)
+- (void)whs_sd_setImageWithURL:(NSURL *)url placeholderImage:(UIImage *)ph
+                       options:(NSUInteger)options context:(id)context
+                      progress:(id)progress completed:(id)completed {
+    whs_captureURL(url);
+    [self whs_sd_setImageWithURL:url placeholderImage:ph options:options context:context
+                        progress:progress completed:completed];
 }
 @end
 
-static void whs_installDownloadUnlock(void) {
-    if (!whs_flag(@"whs_save", YES)) return;
-    for (int i = 0; kWHSKnownSaveClasses[i]; i++) {
-        Class c = NSClassFromString([NSString stringWithUTF8String:kWHSKnownSaveClasses[i]]);
-        if (c) whs_patchSaveClass(c);
-    }
-    whs_exchangeClass(NSClassFromString(@"NSJSONSerialization"),
-                      @selector(JSONObjectWithData:options:error:),
-                      @selector(whs_JSONObjectWithData:options:error:));
-    WHSLog(@"下载/保存解锁模块已装载");
+@interface SDWebImageManager (WHS)
+- (id)whs_downloadImageWithURL:(NSURL *)url options:(NSUInteger)options
+                       context:(id)context progress:(id)progress completed:(id)completed;
+@end
+@implementation SDWebImageManager (WHS)
+- (id)whs_downloadImageWithURL:(NSURL *)url options:(NSUInteger)options
+                       context:(id)context progress:(id)progress completed:(id)completed {
+    whs_captureURL(url);
+    return [self whs_downloadImageWithURL:url options:options context:context
+                                progress:progress completed:completed];
+}
+@end
+
+static void whs_installImageHook(void) {
+    Class iv = NSClassFromString(@"UIImageView");
+    SEL a = @selector(sd_setImageWithURL:placeholderImage:options:context:progress:completed:);
+    SEL b = @selector(whs_sd_setImageWithURL:placeholderImage:options:context:progress:completed:);
+    if (iv && class_getInstanceMethod(iv, a) && class_getInstanceMethod(iv, b))
+        method_exchangeImplementations(class_getInstanceMethod(iv, a), class_getInstanceMethod(iv, b));
+
+    Class mgr = NSClassFromString(@"SDWebImageManager");
+    SEL ma = @selector(downloadImageWithURL:options:context:progress:completed:);
+    SEL mb = @selector(whs_downloadImageWithURL:options:context:progress:completed:);
+    if (mgr && class_getInstanceMethod(mgr, ma) && class_getInstanceMethod(mgr, mb))
+        method_exchangeImplementations(class_getInstanceMethod(mgr, ma), class_getInstanceMethod(mgr, mb));
+    WHSLog(@"SDWebImage 图片 URL 捕获已装载");
 }
 
-#pragma mark - EXIF 提取（原图拍摄信息：手机/光圈/快门/ISO/焦距/镜头/时间）
+#pragma mark - EXIF 提取
 static NSDictionary *whs_extractExif(NSData *data) {
     if (!data) return nil;
     CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
@@ -204,9 +156,9 @@ static NSDictionary *whs_extractExif(NSData *data) {
     NSDictionary *tiff = m[(__bridge NSString *)kCGImagePropertyTIFFDictionary];
     NSDictionary *exif = m[(__bridge NSString *)kCGImagePropertyExifDictionary];
     if (tiff) {
-        if (tiff[(__bridge NSString *)kCGImagePropertyTIFFMake])   out[@"相机品牌"] = tiff[(__bridge NSString *)kCGImagePropertyTIFFMake];
-        if (tiff[(__bridge NSString *)kCGImagePropertyTIFFModel])  out[@"相机型号"] = tiff[(__bridge NSString *)kCGImagePropertyTIFFModel];
-        if (tiff[(__bridge NSString *)kCGImagePropertyTIFFSoftware]) out[@"软件"] = tiff[(__bridge NSString *)kCGImagePropertyTIFFSoftware];
+        if (tiff[(__bridge NSString *)kCGImagePropertyTIFFMake])    out[@"相机品牌"] = tiff[(__bridge NSString *)kCGImagePropertyTIFFMake];
+        if (tiff[(__bridge NSString *)kCGImagePropertyTIFFModel])   out[@"相机型号"] = tiff[(__bridge NSString *)kCGImagePropertyTIFFModel];
+        if (tiff[(__bridge NSString *)kCGImagePropertyTIFFSoftware]) out[@"软件"]   = tiff[(__bridge NSString *)kCGImagePropertyTIFFSoftware];
     }
     if (exif) {
         if (exif[(__bridge NSString *)kCGImagePropertyExifFNumber])
@@ -227,84 +179,36 @@ static void whs_showExif(NSDictionary *exif) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMutableString *s = [NSMutableString string];
         for (NSString *k in exif) [s appendFormat:@"%@：%@\n", k, exif[k]];
-        if (s.length) {
-            [UIPasteboard generalPasteboard].string = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        }
-        UIWindow *w = UIApplication.sharedApplication.keyWindow;
-        UIViewController *top = w.rootViewController;
-        while (top.presentedViewController) top = top.presentedViewController;
+        if (s.length) [UIPasteboard generalPasteboard].string =
+            [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        UIViewController *top = whs_topController();
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"图片原始信息（已复制）"
-                                                                  message:(s.length ? s : @"未检测到 EXIF（可能是平台处理后的图）")
+                                                                  message:(s.length ? s : @"未检测到 EXIF（多为平台上传时已抹除）")
                                                            preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-        [top presentViewController:a animated:YES completion:nil];
+        if (top) [top presentViewController:a animated:YES completion:nil];
     });
 }
 
-#pragma mark - 浮窗 + 兜底抓取 / 下载（核心入口）
-@class WHSSaveTrigger;
-static UIButton *whs_floatingButton = nil;
-static WHSSaveTrigger *whs_trigger = nil;
-
-static BOOL whs_isMediaHost(NSString *s) {
-    return [s containsString:@"xhscdn"] || [s containsString:@"xiaohongshu"] ||
-           [s containsString:@"sns-img"] || [s containsString:@"sns-webpic"] ||
-           [s containsString:@"sns-video"] || [s containsString:@"fe-video"] ||
-           [s containsString:@"ci.xiaohongshu"];
-}
-
-static void whs_collectURLs(id obj, NSMutableSet *out, NSInteger depth) {
-    if (!obj || depth > 6) return;
-    if ([obj isKindOfClass:[NSString class]]) {
-        NSString *s = obj;
-        if (([s hasPrefix:@"http"] || [s hasPrefix:@"https"]) && whs_isMediaHost(s)) [out addObject:s];
-        return;
-    }
-    if ([obj isKindOfClass:[NSURL class]]) {
-        NSString *s = [obj absoluteString];
-        if (whs_isMediaHost(s) || [s hasPrefix:@"file:"]) [out addObject:s];
-        return;
-    }
-    if ([obj isKindOfClass:[NSArray class]]) { for (id i in obj) whs_collectURLs(i, out, depth + 1); return; }
-    if ([obj isKindOfClass:[NSDictionary class]]) { for (id i in [obj allValues]) whs_collectURLs(i, out, depth + 1); return; }
-    if ([obj isKindOfClass:[AVURLAsset class]]) {
-        NSString *s = [[obj URL] absoluteString];
-        if (whs_isMediaHost(s) || [s hasPrefix:@"file:"]) [out addObject:s];
-        return;
-    }
-    for (NSString *k in @[@"imageURL",@"imageUrl",@"url",@"currentImageURL",@"sd_imageURL",@"yy_imageURL",
-                          @"videoURL",@"videoUrl",@"video_url",@"videoUrlString",@"master_url",@"originUrl",
-                          @"videoSourceUrl",@"currentVideoURL",@"note",@"model",@"viewModel",@"media",
-                          @"imageInfo",@"noteModel",@"videoModel",@"videoInfo",@"mediaModel",@"data",@"item",@"content"]) {
-        @try { if ([obj respondsToSelector:NSSelectorFromString(k)]) whs_collectURLs([obj valueForKey:k], out, depth + 1); }
-        @catch (__unused NSException *e) {}
-    }
-}
-
-static void whs_collectFromView(UIView *root, NSMutableSet *out) {
-    if (!root) return;
-    UIView *v = root;
-    for (int i = 0; i < 12 && v; i++, v = v.superview) whs_collectURLs(v, out, 0);
-    for (UIView *sub in root.subviews) whs_collectFromView(sub, out);
-}
-
+#pragma mark - 下载 / 保存
 static void whs_toast(NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = UIApplication.sharedApplication.keyWindow;
+        UIWindow *w = whs_activeWindow();
         if (!w) return;
         UILabel *l = [[UILabel alloc] init];
-        l.text = msg;
-        l.textColor = UIColor.whiteColor;
-        l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
+        l.text = msg; l.textColor = UIColor.whiteColor;
+        l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.82];
         l.font = [UIFont systemFontOfSize:14];
         l.textAlignment = NSTextAlignmentCenter;
-        l.layer.cornerRadius = 8;
-        l.layer.masksToBounds = YES;
-        [l sizeToFit];
-        CGFloat bw = l.bounds.size.width + 24;
-        l.frame = CGRectMake((w.bounds.size.width - bw) / 2, w.bounds.size.height - 120, bw, 36);
+        l.layer.cornerRadius = 8; l.layer.masksToBounds = YES;
+        l.numberOfLines = 0;
+        CGSize sz = [l.text boundingRectWithSize:CGSizeMake(260, 200)
+                                         options:NSStringDrawingUsesLineFragmentOrigin
+                                      attributes:@{NSFontAttributeName:l.font} context:nil].size;
+        CGFloat bw = sz.width + 28, bh = sz.height + 20;
+        l.frame = CGRectMake((w.bounds.size.width - bw) / 2, w.bounds.size.height - 130, bw, bh);
         [w addSubview:l];
-        [UIView animateWithDuration:0.3 delay:1.5 options:0 animations:^{ l.alpha = 0; }
+        [UIView animateWithDuration:0.3 delay:1.6 options:0 animations:^{ l.alpha = 0; }
                          completion:^(BOOL f) { [l removeFromSuperview]; }];
     });
 }
@@ -340,16 +244,15 @@ static void whs_saveVideoURL(NSURL *url, void (^done)(BOOL)) {
             [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
                 [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:[NSURL fileURLWithPath:tmp]];
             } completionHandler:^(BOOL ok2, NSError *e2 __attribute__((unused))) {
-                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                done(ok2);
+                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil]; done(ok2);
             }];
         } else { done(NO); }
     }];
 }
 
-// 下载一张图，并提取 EXIF 弹窗
-static void whs_downloadImageWithExif(NSString *urlString) {
-    NSURL *url = [NSURL URLWithString:urlString];
+static void whs_downloadImage(NSString *urlString) {
+    NSString *u = whs_originalURL(urlString);
+    NSURL *url = [NSURL URLWithString:u];
     if (!url) return;
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     [req setValue:@"https://www.xiaohongshu.com" forHTTPHeaderField:@"Referer"];
@@ -360,12 +263,8 @@ static void whs_downloadImageWithExif(NSString *urlString) {
         if (!data || err) { whs_toast(@"下载失败"); return; }
         NSDictionary *exif = whs_extractExif(data);
         whs_saveImageData(data, ^(BOOL ok) {
-            if (ok) {
-                whs_toast(@"已保存到相册");
-                if (exif) whs_showExif(exif);
-            } else {
-                whs_toast(@"保存失败（请允许相册权限）");
-            }
+            if (ok) { whs_toast(@"已保存到相册"); if (exif) whs_showExif(exif); }
+            else whs_toast(@"保存失败（请允许相册权限）");
         });
     }];
     [task resume];
@@ -389,58 +288,147 @@ static void whs_downloadVideo(NSString *urlString) {
     [task resume];
 }
 
-// 浮窗触发：从当前界面抓取媒体，逐张下载原图并解析 EXIF
-static void whs_tryDownloadCurrent(void) {
-    UIWindow *w = UIApplication.sharedApplication.keyWindow;
-    if (!w) { whs_toast(@"无窗口"); return; }
-    NSMutableSet *urls = [NSMutableSet set];
-    whs_collectFromView(w, urls);
-    if (urls.count == 0) { whs_toast(@"未找到媒体，试试双指长按"); return; }
-    BOOL anyVideo = NO;
-    for (NSString *u in urls) if ([u containsString:@"video"] || [u containsString:@"mp4"]) { anyVideo = YES; break; }
-    NSInteger n = 0;
-    for (NSString *u in urls) {
-        if (n++ > 8) break; // 一次最多抓 9 张，避免刷屏
-        BOOL v = anyVideo && ([u containsString:@"video"] || [u containsString:@"mp4"]);
-        if (v) whs_downloadVideo(u); else whs_downloadImageWithExif(u);
+#pragma mark - 窗口 / 顶层控制器辅助
+static UIWindow *whs_activeWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) {
+                UIWindowScene *ws = (UIWindowScene *)s;
+                for (UIWindow *w in ws.windows) if (w.isKeyWindow) return w;
+                return ws.windows.firstObject;
+            }
+        }
     }
-    whs_toast([NSString stringWithFormat:@"找到 %lu 个媒体，开始下载原图", (unsigned long)urls.count]);
+    return UIApplication.sharedApplication.keyWindow;
 }
 
-@interface WHSSaveTrigger : NSObject
-- (void)onTap;
-- (void)onGesture:(UILongPressGestureRecognizer *)g;
-@end
-@implementation WHSSaveTrigger
-- (void)onTap { whs_tryDownloadCurrent(); }
-- (void)onGesture:(UILongPressGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateBegan) whs_tryDownloadCurrent();
+static UIViewController *whs_topController(void) {
+    UIViewController *top = whs_activeWindow().rootViewController;
+    while (top) {
+        if (top.presentedViewController) { top = top.presentedViewController; continue; }
+        if ([top isKindOfClass:[UINavigationController class]])
+            top = ((UINavigationController *)top).visibleViewController;
+        else if ([top isKindOfClass:[UITabBarController class]])
+            top = ((UITabBarController *)top).selectedViewController;
+        else break;
+    }
+    return top;
 }
-@end
+
+#pragma mark - 浮窗（独立顶层 window，可拖动，点开媒体列表）
+static UIWindow *whs_floatWindow = nil;
+static UIButton *whs_floatButton = nil;
+
+static void whs_presentPicker(void) {
+    __block NSArray<NSString *> *list = nil;
+    dispatch_sync(whs_captureQueue, ^{ list = whs_captured ? [whs_captured.array copy] : @[]; });
+    NSMutableArray<NSString *> *picked = [NSMutableArray array];
+    for (NSString *u in list) {
+        [picked addObject:u];
+        if (picked.count >= 15) break;
+    }
+    if (picked.count == 0) { whs_toast(@"还没抓到媒体，先进笔记打开图片/视频"); return; }
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"选择要保存的媒体"
+                                                                  message:[NSString stringWithFormat:@"已抓取 %lu 个（最多显示 15）", (unsigned long)picked.count]
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    NSInteger idx = 0;
+    for (NSString *u in picked) {
+        BOOL vid = whs_isVideoURL(u);
+        NSString *title = [NSString stringWithFormat:@"%@ #%ld  %@", vid ? @"🎬视频" : @"🖼图片",
+                           (long)(idx + 1), [u.pathExtension.uppercaseString ?: @"?" stringByAppendingString:@""]];
+        if (u.pathExtension.length == 0) title = [NSString stringWithFormat:@"%@ #%ld", vid ? @"🎬视频" : @"🖼图片", (long)(idx + 1)];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *a __attribute__((unused))) {
+            if (vid) whs_downloadVideo(u); else whs_downloadImage(u);
+        }]];
+        idx++;
+    }
+    // 一次性下载全部图片
+    [sheet addAction:[UIAlertAction actionWithTitle:@"⬇ 下载全部图片" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a __attribute__((unused))) {
+        NSInteger n = 0;
+        for (NSString *u in picked) {
+            if (whs_isVideoURL(u)) continue;
+            whs_downloadImage(u);
+            if (++n > 9) break;
+        }
+        whs_toast([NSString stringWithFormat:@"已发起 %ld 张图片下载", (long)n]);
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIViewController *top = whs_topController();
+    if (top) [top presentViewController:sheet animated:YES completion:nil];
+}
 
 static void whs_installFloatingUI(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *w = UIApplication.sharedApplication.keyWindow;
-        if (!w || whs_floatingButton) return;
-        if (!whs_trigger) whs_trigger = [[WHSSaveTrigger alloc] init];
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(w.bounds.size.width - 56, w.bounds.size.height - 130, 44, 44);
-        [b setTitle:@"↓" forState:UIControlStateNormal];
-        b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (whs_floatWindow) return;
+        UIWindowScene *scene = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) {
+                    scene = (UIWindowScene *)s; break;
+                }
+            }
+        }
+        UIWindow *w = nil;
+        if (@available(iOS 13.0, *)) { if (scene) w = [[UIWindow alloc] initWithWindowScene:scene]; }
+        if (!w) w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        w.windowLevel = UIWindowLevelAlert + 100;
+        w.backgroundColor = [UIColor clearColor];
+        w.hidden = NO;
+        w.userInteractionEnabled = YES;
+
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        CGFloat sz = 56;
+        b.frame = CGRectMake(UIScreen.mainScreen.bounds.size.width - sz - 16,
+                             UIScreen.mainScreen.bounds.size.height - sz - 120, sz, sz);
+        [b setTitle:@"⬇" forState:UIControlStateNormal];
         [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont systemFontOfSize:22];
-        b.layer.cornerRadius = 22;
+        b.titleLabel.font = [UIFont systemFontOfSize:26];
+        b.backgroundColor = [UIColor colorWithRed:0.95 green:0.23 blue:0.35 alpha:0.92];
+        b.layer.cornerRadius = sz / 2;
         b.layer.masksToBounds = YES;
-        [b addTarget:whs_trigger action:@selector(onTap) forControlEvents:UIControlEventTouchUpInside];
+        b.layer.shadowColor = [UIColor blackColor].CGColor;
+        b.layer.shadowOpacity = 0.4; b.layer.shadowRadius = 6;
+        [b addTarget:[WHSSaveTrigger shared] action:@selector(onTap) forControlEvents:UIControlEventTouchUpInside];
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:[WHSSaveTrigger shared]
+                                                                                        action:@selector(onLongPress:)];
+        [b addGestureRecognizer:lp];
+        // 拖动
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[WHSSaveTrigger shared]
+                                                                             action:@selector(onPan:)];
+        [b addGestureRecognizer:pan];
+
         [w addSubview:b];
-        whs_floatingButton = b;
-        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:whs_trigger
-                                                                                        action:@selector(onGesture:)];
-        lp.numberOfTouchesRequired = 2;
-        [w addGestureRecognizer:lp];
-        WHSLog(@"下载浮窗已装载（点击或双指长按下载原图）");
+        whs_floatWindow = w;
+        whs_floatButton = b;
+        WHSLog(@"浮窗已装载（点开媒体列表 / 长按存最近一张 / 可拖动）");
     });
 }
+
+#pragma mark - 触发逻辑
+@implementation WHSSaveTrigger
++ (instancetype)shared { static WHSSaveTrigger *s; static dispatch_once_t t; dispatch_once(&t, ^{ s = [WHSSaveTrigger new]; }); return s; }
+- (void)onTap { whs_presentPicker(); }
+- (void)onLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    __block NSString *last = nil;
+    dispatch_sync(whs_captureQueue, ^{ last = whs_captured.firstObject; });
+    if (!last) { whs_toast(@"还没有抓到媒体"); return; }
+    if (whs_isVideoURL(last)) whs_downloadVideo(last); else whs_downloadImage(last);
+}
+- (void)onPan:(UIPanGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateChanged) {
+        CGPoint t = [g translationInView:g.view.superview];
+        CGPoint c = g.view.center;
+        c.x += t.x; c.y += t.y;
+        CGFloat W = UIScreen.mainScreen.bounds.size.width, H = UIScreen.mainScreen.bounds.size.height;
+        c.x = MAX(30, MIN(W - 30, c.x)); c.y = MAX(60, MIN(H - 30, c.y));
+        g.view.center = c;
+        [g setTranslation:CGPointZero inView:g.view.superview];
+    }
+}
+@end
 
 #pragma mark - 入口
 __attribute__((constructor))
@@ -448,9 +436,8 @@ static void whs_entry(void) {
     WHSLog(@"WHS download tweak loaded");
     if (!whs_isTarget()) { WHSLog(@"非目标 App，退出"); return; }
     if (!whs_flag(@"whs_enabled", YES)) { WHSLog(@"总开关关闭"); return; }
-
-    whs_installDownloadUnlock(); // 解锁原生保存 + JSON 下载开关
-    whs_installFloatingUI();     // 浮窗 ↓ / 双指长按 → 抓 CDN 原图下载 + EXIF
-
+    whs_captureQueue = dispatch_queue_create("whs.capture", DISPATCH_QUEUE_SERIAL);
+    whs_installImageHook();     // 抓真实媒体 URL
+    whs_installFloatingUI();    // 浮窗 + 媒体列表（可控）
     WHSLog(@"WHS 下载模块装载完成");
 }
